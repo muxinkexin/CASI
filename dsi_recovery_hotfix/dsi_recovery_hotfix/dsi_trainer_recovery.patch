@@ -1,0 +1,87 @@
+--- a/dsi_trainer.py
++++ b/dsi_trainer.py
+@@ -15,6 +15,7 @@
+ import torch.nn.functional as F
+ 
+ import networks
++from dsi_mode_compat import set_mode_tree, freeze_module  # DSI_MODE_COMPAT_V1
+ from networks.variance_decoder import VarDecoder
+ from trainer import Trainer
+ from linear_warmup_cosine_annealing_warm_restarts_weight_decay import ChainedScheduler
+@@ -54,7 +55,15 @@
+         self.reference_provenance = {}
+         self.refresh_history = []
+         options.disable_automasking = True
+-        super().__init__(options)
++        # Resume checkpoints already contain trained models and initial_depth.
++        # Avoid reloading ImageNet files/downloads before restoring those states.
++        initial_options = (options.weights_init, options.mypretrain)
++        if options.dsi_resume:
++            options.weights_init, options.mypretrain = "scratch", None
++        try:
++            super().__init__(options)
++        finally:
++            options.weights_init, options.mypretrain = initial_options
+         if len(self.train_loader) == 0 or len(self.val_loader) == 0:
+             raise ValueError("Train and validation splits must each contain at least batch_size samples")
+         self.initial_depth = {name: cpu_state(self.models[name]) for name in ("encoder", "depth")}
+@@ -116,8 +125,8 @@
+         encoder = networks.LiteMono(model=self.opt.model, drop_path_rate=self.opt.drop_path,
+                                     height=self.opt.height, width=self.opt.width).to(self.device)
+         decoder = networks.DepthDecoder(encoder.num_ch_enc, self.opt.scales).to(self.device)
+-        return {"encoder": encoder.eval().requires_grad_(False),
+-                "depth": decoder.eval().requires_grad_(False)}
++        return {"encoder": freeze_module(encoder),
++                "depth": freeze_module(decoder)}
+ 
+     def _prepare_inhibit(self, resume_state=None, checkpoint_dir=None):
+         self.phase = "inhibit"
+@@ -147,9 +156,9 @@
+             pose_folder = checkpoint_dir
+         for name, model in self.models_pose.items():
+             load_strict(model, pose_folder / (name + ".pth"))
+-            model.requires_grad_(False).eval()
++            freeze_module(model)
+             model.zero_grad(set_to_none=True)
+-        self.models["var_encoder"] = networks.ResnetEncoder(18, self.opt.weights_init == "pretrained", num_input_images=3).to(self.device)
++        self.models["var_encoder"] = networks.ResnetEncoder(18, resume_state is None and self.opt.weights_init == "pretrained", num_input_images=3).to(self.device)
+         self.models["var"] = VarDecoder(self.models["var_encoder"].num_ch_enc, self.opt.scales).to(self.device)
+         self.parameters_to_train = [p for model in self.models.values() for p in model.parameters() if p.requires_grad]
+         self.model_optimizer = torch.optim.AdamW(self.parameters_to_train, lr=self.opt.dsi_lr, weight_decay=self.opt.weight_decay)
+@@ -160,17 +169,22 @@
+         print("DSI stage 2: reset DepthNet, freeze Pose/late reference; fixed mu={}, beta={}".format(self.opt.dsi_mu, self.opt.dsi_beta))
+ 
+     def set_train(self):
+-        super().set_train()
++        for model in self.models.values():
++            set_mode_tree(model, True)
+         for model in self.models_pose.values():
+-            model.train(self.phase == "raw")
++            set_mode_tree(model, self.phase == "raw")
+         for reference in self.reference.values():
+             for model in reference.values():
+-                model.eval()
++                set_mode_tree(model, False)
+ 
+     def set_eval(self):
+-        super().set_eval()
++        for model in self.models.values():
++            set_mode_tree(model, False)
+         for model in self.models_pose.values():
+-            model.eval()
++            set_mode_tree(model, False)
++        for reference in self.reference.values():
++            for model in reference.values():
++                set_mode_tree(model, False)
+ 
+     def process_batch(self, inputs):
+         if self.phase == "raw":
+@@ -237,7 +251,7 @@
+                 if phase == "inhibit" and refresh_due(completed, self.opt.dsi_refresh_start, self.opt.dsi_refresh_every):
+                     for name, model in self.reference["early"].items():
+                         model.load_state_dict(self.models[name].state_dict(), strict=True)
+-                        model.eval().requires_grad_(False)
++                        freeze_module(model)
+                     self.refresh_history.append(completed)
+                     print("DSI refreshed early reference after inhibit epoch", completed)
+                 force = phase == "raw" and self.phase_epoch == self.opt.dsi_early_epoch
